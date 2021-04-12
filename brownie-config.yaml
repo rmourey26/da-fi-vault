@@ -2,6 +2,8 @@
 networks:
   default: development
 
+autofetch_sources: true
+
 # require OpenZepplin Contracts
 dependencies:
   - OpenZeppelin/openzeppelin-contracts@3.1.0
@@ -11,7 +13,7 @@ compiler:
   solc:
     version: 0.6.12
     remappings:
-      - "@openzeppelinV3=OpenZeppelin/openzeppelin-contracts@3.1.0"
+      - "@openzeppelin=OpenZeppelin/openzeppelin-contracts@3.1.0"
 
 reports:
   exclude_paths:
@@ -19,3 +21,5 @@ reports:
     - contracts/test/TestGuestList.sol
   exclude_contracts:
     - SafeMath
+    - SafeERC20
+    - Address

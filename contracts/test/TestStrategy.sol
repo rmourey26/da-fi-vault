@@ -2,23 +2,59 @@
 pragma solidity 0.6.12;
 pragma experimental ABIEncoderV2;
 
-import {BaseStrategy, StrategyParams} from "../BaseStrategy.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {BaseStrategyInitializable, StrategyParams, VaultAPI} from "../BaseStrategy.sol";
 
 /*
  * This Strategy serves as both a mock Strategy for testing, and an example
  * for integrators on how to use BaseStrategy
  */
 
-contract TestStrategy is BaseStrategy {
-    constructor(address _vault) public BaseStrategy(_vault) {}
+contract TestStrategy is BaseStrategyInitializable {
+    bool public doReentrancy;
+    bool public delegateEverything;
 
-    function name() external override pure returns (string memory) {
-        return "TestStrategy";
+    // Some token that needs to be protected for some reason
+    // Initialize this to some fake address, because we're just using it
+    // to test `BaseStrategy.protectedTokens()`
+    address public constant protectedToken = address(0xbad);
+
+    constructor(address _vault) public BaseStrategyInitializable(_vault) {}
+
+    function name() external override view returns (string memory) {
+        return string(abi.encodePacked("TestStrategy ", apiVersion()));
+    }
+
+    // NOTE: This is a test-only function to simulate delegation
+    function _toggleDelegation() public {
+        delegateEverything = !delegateEverything;
+    }
+
+    function delegatedAssets() external override view returns (uint256) {
+        if (delegateEverything) {
+            return vault.strategies(address(this)).totalDebt;
+        } else {
+            return 0;
+        }
     }
 
     // NOTE: This is a test-only function to simulate losses
     function _takeFunds(uint256 amount) public {
-        want.transfer(msg.sender, amount);
+        want.safeTransfer(msg.sender, amount);
+    }
+
+    // NOTE: This is a test-only function to enable reentrancy on withdraw
+    function _toggleReentrancyExploit() public {
+        doReentrancy = !doReentrancy;
+    }
+
+    // NOTE: This is a test-only function to simulate a wrong want token
+    function _setWant(IERC20 _want) public {
+        want = _want;
+    }
+
+    function ethToWant(uint256 amtInWei) public override view returns (uint256) {
+        return amtInWei; // 1:1 conversion for testing
     }
 
     function estimatedTotalAssets() public override view returns (uint256) {
@@ -58,33 +94,25 @@ contract TestStrategy is BaseStrategy {
         // Whatever we have "free", consider it "invested" now
     }
 
-    function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _amountFreed) {
-        uint256 totalAssets = want.balanceOf(address(this));
-        if (_amountNeeded >= totalAssets) {
-            _amountFreed = totalAssets;
-        } else {
-            _amountFreed = _amountNeeded;
+    function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss) {
+        if (doReentrancy) {
+            // simulate a malicious protocol or reentrancy situation triggered by strategy withdraw interactions
+            uint256 stratBalance = VaultAPI(address(vault)).balanceOf(address(this));
+            VaultAPI(address(vault)).withdraw(stratBalance, address(this));
         }
-    }
 
-    function exitPosition(uint256 _debtOutstanding)
-        internal
-        override
-        returns (
-            uint256 _profit,
-            uint256 _loss,
-            uint256 _debtPayment
-        )
-    {
+        uint256 totalDebt = vault.strategies(address(this)).totalDebt;
         uint256 totalAssets = want.balanceOf(address(this));
-
-        // Three possibilities, profit, breakeven, losses
-        if (totalAssets >= _debtOutstanding) {
-            _profit = totalAssets.sub(_debtOutstanding);
-            _debtPayment = _debtOutstanding;
+        if (_amountNeeded > totalAssets) {
+            _liquidatedAmount = totalAssets;
+            _loss = _amountNeeded.sub(totalAssets);
         } else {
-            _debtPayment = totalAssets;
-            _loss = _debtOutstanding.sub(totalAssets);
+            // NOTE: Just in case something was stolen from this contract
+            if (totalDebt > totalAssets) {
+                _loss = totalDebt.sub(totalAssets);
+                if (_loss > _amountNeeded) _loss = _amountNeeded;
+            }
+            _liquidatedAmount = _amountNeeded;
         }
     }
 
@@ -93,6 +121,8 @@ contract TestStrategy is BaseStrategy {
     }
 
     function protectedTokens() internal override view returns (address[] memory) {
-        return new address[](0); // No additional tokens/tokenized positions for mock
+        address[] memory protected = new address[](1);
+        protected[0] = protectedToken;
+        return protected;
     }
 }

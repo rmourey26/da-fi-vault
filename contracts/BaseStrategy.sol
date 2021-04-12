@@ -2,14 +2,16 @@
 pragma solidity >=0.6.0 <0.7.0;
 pragma experimental ABIEncoderV2;
 
-import "@openzeppelinV3/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelinV3/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/math/SafeMath.sol";
 
 struct StrategyParams {
     uint256 performanceFee;
     uint256 activation;
-    uint256 debtLimit;
-    uint256 rateLimit;
+    uint256 debtRatio;
+    uint256 minDebtPerHarvest;
+    uint256 maxDebtPerHarvest;
     uint256 lastReport;
     uint256 totalDebt;
     uint256 totalGain;
@@ -17,11 +19,47 @@ struct StrategyParams {
 }
 
 interface VaultAPI is IERC20 {
-    function apiVersion() external view returns (string memory);
+    function name() external view returns (string calldata);
+
+    function symbol() external view returns (string calldata);
+
+    function decimals() external view returns (uint256);
+
+    function apiVersion() external pure returns (string memory);
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 amount,
+        uint256 expiry,
+        bytes calldata signature
+    ) external returns (bool);
+
+    // NOTE: Vyper produces multiple signatures for a given function with "default" args
+    function deposit() external returns (uint256);
+
+    function deposit(uint256 amount) external returns (uint256);
+
+    function deposit(uint256 amount, address recipient) external returns (uint256);
+
+    // NOTE: Vyper produces multiple signatures for a given function with "default" args
+    function withdraw() external returns (uint256);
+
+    function withdraw(uint256 maxShares) external returns (uint256);
+
+    function withdraw(uint256 maxShares, address recipient) external returns (uint256);
 
     function token() external view returns (address);
 
     function strategies(address _strategy) external view returns (StrategyParams memory);
+
+    function pricePerShare() external view returns (uint256);
+
+    function totalAssets() external view returns (uint256);
+
+    function depositLimit() external view returns (uint256);
+
+    function maxAvailableShares() external view returns (uint256);
 
     /**
      * View how much the Vault would increase this Strategy's borrow limit,
@@ -57,16 +95,6 @@ interface VaultAPI is IERC20 {
     ) external returns (uint256);
 
     /**
-     * This function is used in the scenario where there is a newer Strategy
-     * that would hold the same positions as this one, and those positions are
-     * easily transferrable to the newer Strategy. These positions must be able
-     * to be transferred at the moment this call is made, if any prep is
-     * required to execute a full transfer in one transaction, that must be
-     * accounted for separately from this call.
-     */
-    function migrateStrategy(address _newStrategy) external;
-
-    /**
      * This function should only be used in the scenario where the Strategy is
      * being retired but no migration of the positions are possible, or in the
      * extreme scenario that the Strategy needs to be put into "Emergency Exit"
@@ -84,23 +112,41 @@ interface VaultAPI is IERC20 {
      * is subject to governance defined by the Vault.
      */
     function governance() external view returns (address);
+
+    /**
+     * View the management address of the Vault to assert privileged functions
+     * can only be called by management. The Strategy serves the Vault, so it
+     * is subject to management defined by the Vault.
+     */
+    function management() external view returns (address);
+
+    /**
+     * View the guardian address of the Vault to assert privileged functions
+     * can only be called by guardian. The Strategy serves the Vault, so it
+     * is subject to guardian defined by the Vault.
+     */
+    function guardian() external view returns (address);
 }
 
 /**
  * This interface is here for the keeper bot to use.
  */
 interface StrategyAPI {
-    function apiVersion() external pure returns (string memory);
-
-    function isActive() external view returns (bool);
-
-    function delegatedAssets() external virtual pure returns (uint256);
-
-    function name() external pure returns (string memory);
+    function name() external view returns (string memory);
 
     function vault() external view returns (address);
 
+    function want() external view returns (address);
+
+    function apiVersion() external pure returns (string memory);
+
     function keeper() external view returns (address);
+
+    function isActive() external view returns (bool);
+
+    function delegatedAssets() external view returns (uint256);
+
+    function estimatedTotalAssets() external view returns (uint256);
 
     function tendTrigger(uint256 callCost) external view returns (bool);
 
@@ -131,6 +177,8 @@ interface StrategyAPI {
  */
 abstract contract BaseStrategy {
     using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+    string public metadataURI;
 
     /**
      * @notice
@@ -140,7 +188,7 @@ abstract contract BaseStrategy {
      * @return A string which holds the current API version of this contract.
      */
     function apiVersion() public pure returns (string memory) {
-        return "0.2.2";
+        return "0.3.5";
     }
 
     /**
@@ -151,7 +199,7 @@ abstract contract BaseStrategy {
      *  `apiVersion()` function above.
      * @return This Strategy's name.
      */
-    function name() external virtual pure returns (string memory);
+    function name() external virtual view returns (string memory);
 
     /**
      * @notice
@@ -162,11 +210,13 @@ abstract contract BaseStrategy {
      *  Strategy is somehow delegated inside another part of of Yearn's ecosystem e.g. another Vault.
      *  Note that this value must be strictly less than or equal to the amount provided by
      *  `estimatedTotalAssets()` below, as the TVL calc will be total assets minus delegated assets.
+     *  Also note that this value is used to determine the total assets under management by this
+     *  strategy, for the purposes of computing the management fee in `Vault`
      * @return
      *  The amount of assets this strategy manages that should not be included in Yearn's Total Value
      *  Locked (TVL) calculation across it's ecosystem.
      */
-    function delegatedAssets() external virtual pure returns (uint256) {
+    function delegatedAssets() external virtual view returns (uint256) {
         return 0;
     }
 
@@ -186,23 +236,33 @@ abstract contract BaseStrategy {
 
     event UpdatedRewards(address rewards);
 
-    event UpdatedReportDelay(uint256 delay);
+    event UpdatedMinReportDelay(uint256 delay);
+
+    event UpdatedMaxReportDelay(uint256 delay);
 
     event UpdatedProfitFactor(uint256 profitFactor);
 
     event UpdatedDebtThreshold(uint256 debtThreshold);
 
+    event EmergencyExitEnabled();
+
+    event UpdatedMetadataURI(string metadataURI);
+
     // The minimum number of seconds between harvest calls. See
     // `setMinReportDelay()` for more details.
-    uint256 public minReportDelay = 86400; // ~ once a day
+    uint256 public minReportDelay;
+
+    // The maximum number of seconds between harvest calls. See
+    // `setMaxReportDelay()` for more details.
+    uint256 public maxReportDelay;
 
     // The minimum multiple that `callCost` must be above the credit/profit to
     // be "justifiable". See `setProfitFactor()` for more details.
-    uint256 public profitFactor = 100;
+    uint256 public profitFactor;
 
     // Use this to adjust the threshold at which running a debt causes a
     // harvest trigger. See `setDebtThreshold()` for more details.
-    uint256 public debtThreshold = 0;
+    uint256 public debtThreshold;
 
     // See note on `setEmergencyExit()`.
     bool public emergencyExit;
@@ -224,8 +284,19 @@ abstract contract BaseStrategy {
     }
 
     modifier onlyKeepers() {
-        require(msg.sender == keeper || msg.sender == strategist || msg.sender == governance(), "!authorized");
+        require(
+            msg.sender == keeper ||
+                msg.sender == strategist ||
+                msg.sender == governance() ||
+                msg.sender == vault.guardian() ||
+                msg.sender == vault.management(),
+            "!authorized"
+        );
         _;
+    }
+
+    constructor(address _vault) public {
+        _initialize(_vault, msg.sender, msg.sender, msg.sender);
     }
 
     /**
@@ -235,13 +306,28 @@ abstract contract BaseStrategy {
      * @dev `_vault` should implement `VaultAPI`.
      * @param _vault The address of the Vault responsible for this Strategy.
      */
-    constructor(address _vault) public {
+    function _initialize(
+        address _vault,
+        address _strategist,
+        address _rewards,
+        address _keeper
+    ) internal {
+        require(address(want) == address(0), "Strategy already initialized");
+
         vault = VaultAPI(_vault);
         want = IERC20(vault.token());
-        want.approve(_vault, uint256(-1)); // Give Vault unlimited access (might save gas)
-        strategist = msg.sender;
-        rewards = msg.sender;
-        keeper = msg.sender;
+        want.safeApprove(_vault, uint256(-1)); // Give Vault unlimited access (might save gas)
+        strategist = _strategist;
+        rewards = _rewards;
+        keeper = _keeper;
+
+        // initialize variables
+        minReportDelay = 0;
+        maxReportDelay = 86400;
+        profitFactor = 100;
+        debtThreshold = 0;
+
+        vault.approve(rewards, uint256(-1)); // Allow rewards to be pulled
     }
 
     /**
@@ -252,6 +338,7 @@ abstract contract BaseStrategy {
      * @param _strategist The new address to assign as `strategist`.
      */
     function setStrategist(address _strategist) external onlyAuthorized {
+        require(_strategist != address(0));
         strategist = _strategist;
         emit UpdatedStrategist(_strategist);
     }
@@ -270,42 +357,59 @@ abstract contract BaseStrategy {
      * @param _keeper The new address to assign as `keeper`.
      */
     function setKeeper(address _keeper) external onlyAuthorized {
+        require(_keeper != address(0));
         keeper = _keeper;
         emit UpdatedKeeper(_keeper);
     }
 
     /**
      * @notice
-     *  Used to change `rewards`. Any distributed rewards will cease flowing
-     *  to the old address and begin flowing to this address once the change
-     *  is in effect.
-     *
-     *  This will not change any Strategy reports in progress, only
-     *  new reports made after this change goes into effect.
+     *  Used to change `rewards`. EOA or smart contract which has the permission
+     *  to pull rewards from the vault.
      *
      *  This may only be called by the strategist.
-     * @param _rewards The address to use for collecting rewards.
+     * @param _rewards The address to use for pulling rewards.
      */
     function setRewards(address _rewards) external onlyStrategist {
+        require(_rewards != address(0));
+        vault.approve(rewards, 0);
         rewards = _rewards;
+        vault.approve(rewards, uint256(-1));
         emit UpdatedRewards(_rewards);
     }
 
     /**
      * @notice
      *  Used to change `minReportDelay`. `minReportDelay` is the minimum number
-     *  of blocks that should pass before `harvest()` is called.
+     *  of blocks that should pass for `harvest()` to be called.
      *
      *  For external keepers (such as the Keep3r network), this is the minimum
-     *  time between jobs, to prevent excessive costs. (see `harvestTrigger()`
+     *  time between jobs to wait. (see `harvestTrigger()`
      *  for more details.)
      *
      *  This may only be called by governance or the strategist.
-     * @param _delay The minimum number of blocks to wait between harvests.
+     * @param _delay The minimum number of seconds to wait between harvests.
      */
     function setMinReportDelay(uint256 _delay) external onlyAuthorized {
         minReportDelay = _delay;
-        emit UpdatedReportDelay(_delay);
+        emit UpdatedMinReportDelay(_delay);
+    }
+
+    /**
+     * @notice
+     *  Used to change `maxReportDelay`. `maxReportDelay` is the maximum number
+     *  of blocks that should pass for `harvest()` to be called.
+     *
+     *  For external keepers (such as the Keep3r network), this is the maximum
+     *  time between jobs to wait. (see `harvestTrigger()`
+     *  for more details.)
+     *
+     *  This may only be called by governance or the strategist.
+     * @param _delay The maximum number of seconds to wait between harvests.
+     */
+    function setMaxReportDelay(uint256 _delay) external onlyAuthorized {
+        maxReportDelay = _delay;
+        emit UpdatedMaxReportDelay(_delay);
     }
 
     /**
@@ -342,12 +446,41 @@ abstract contract BaseStrategy {
     }
 
     /**
+     * @notice
+     *  Used to change `metadataURI`. `metadataURI` is used to store the URI
+     * of the file describing the strategy.
+     *
+     *  This may only be called by governance or the strategist.
+     * @param _metadataURI The URI that describe the strategy.
+     */
+    function setMetadataURI(string calldata _metadataURI) external onlyAuthorized {
+        metadataURI = _metadataURI;
+        emit UpdatedMetadataURI(_metadataURI);
+    }
+
+    /**
      * Resolve governance address from Vault contract, used to make assertions
      * on protected functions in the Strategy.
      */
     function governance() internal view returns (address) {
         return vault.governance();
     }
+
+    /**
+     * @notice
+     *  Provide an accurate conversion from `_amtInWei` (denominated in wei)
+     *  to `want` (using the native decimal characteristics of `want`).
+     * @dev
+     *  Care must be taken when working with decimals to assure that the conversion
+     *  is compatible. As an example:
+     *
+     *      given 1e17 wei (0.1 ETH) as input, and want is USDC (6 decimals),
+     *      with USDC/ETH = 1800, this should give back 1800000000 (180 USDC)
+     *
+     * @param _amtInWei The amount (in wei/1e-18 ETH) to convert to `want`
+     * @return The amount in `want` of `_amtInEth` converted to `want`
+     **/
+    function ethToWant(uint256 _amtInWei) public virtual view returns (uint256);
 
     /**
      * @notice
@@ -384,7 +517,7 @@ abstract contract BaseStrategy {
      * @return True if the strategy is actively managing a position.
      */
     function isActive() public view returns (bool) {
-        return vault.strategies(address(this)).debtLimit > 0 || estimatedTotalAssets() > 0;
+        return vault.strategies(address(this)).debtRatio > 0 || estimatedTotalAssets() > 0;
     }
 
     /**
@@ -432,38 +565,18 @@ abstract contract BaseStrategy {
     function adjustPosition(uint256 _debtOutstanding) internal virtual;
 
     /**
-     * Make as much capital as possible "free" for the Vault to take. Some
-     * slippage is allowed, since when this method is called the strategist is
-     * no longer receiving their performance fee. The goal is for the Strategy
-     * to divest as quickly as possible while not suffering exorbitant losses.
-     * This function is used during emergency exit instead of
-     * `prepareReturn()`. This method returns any realized losses incurred,
-     * and should also return the amount of `want` tokens available to repay
-     * outstanding debt to the Vault.
-     */
-    function exitPosition(uint256 _debtOutstanding)
-        internal
-        virtual
-        returns (
-            uint256 _profit,
-            uint256 _loss,
-            uint256 _debtPayment
-        );
-
-    /**
-     *  `Harvest()` calls this function after shares are created during
-     *  `vault.report()`. You can customize this function to any share
-     *  distribution mechanism you want.
+     * Liquidate up to `_amountNeeded` of `want` of this strategy's positions,
+     * irregardless of slippage. Any excess will be re-invested with `adjustPosition()`.
+     * This function should return the amount of `want` tokens made available by the
+     * liquidation. If there is a difference between them, `_loss` indicates whether the
+     * difference is due to a realized loss, or if there is some other sitution at play
+     * (e.g. locked funds) where the amount made available is less than what is needed.
+     * This function is used during emergency exit instead of `prepareReturn()` to
+     * liquidate all of the Strategy's positions back to the Vault.
      *
-     *   See `vault.report()` for further details.
+     * NOTE: The invariant `_liquidatedAmount + _loss <= _amountNeeded` should always be maintained
      */
-    function distributeRewards() internal virtual {
-        // Transfer 100% of newly-minted shares awarded to this contract to the rewards address.
-        uint256 balance = vault.balanceOf(address(this));
-        if (balance > 0) {
-            vault.transfer(rewards, balance);
-        }
-    }
+    function liquidatePosition(uint256 _amountNeeded) internal virtual returns (uint256 _liquidatedAmount, uint256 _loss);
 
     /**
      * @notice
@@ -476,17 +589,18 @@ abstract contract BaseStrategy {
      *  shortly, then this can return `true` even if the keeper might be
      *  "at a loss" (keepers are always reimbursed by Yearn).
      * @dev
-     *  `callCost` must be priced in terms of `want`.
+     *  `callCostInWei` must be priced in terms of `wei` (1e-18 ETH).
      *
      *  This call and `harvestTrigger()` should never return `true` at the same
      *  time.
-     * @param callCost The keeper's estimated cast cost to call `tend()`.
+     * @param callCostInWei The keeper's estimated gas cost to call `tend()` (in wei).
      * @return `true` if `tend()` should be called, `false` otherwise.
      */
-    function tendTrigger(uint256 callCost) public virtual view returns (bool) {
+    function tendTrigger(uint256 callCostInWei) public virtual view returns (bool) {
         // We usually don't need tend, but if there are positions that need
         // active maintainence, overriding this function is how you would
         // signal for that.
+        uint256 callCost = ethToWant(callCostInWei);
         return false;
     }
 
@@ -515,12 +629,12 @@ abstract contract BaseStrategy {
      *  shortly, then this can return `true` even if the keeper might be "at a
      *  loss" (keepers are always reimbursed by Yearn).
      * @dev
-     *  `callCost` must be priced in terms of `want`.
+     *  `callCostInWei` must be priced in terms of `wei` (1e-18 ETH).
      *
      *  This call and `tendTrigger` should never return `true` at the
      *  same time.
      *
-     *  See `minReportDelay`, `profitFactor`, `debtThreshold` to adjust the
+     *  See `min/maxReportDelay`, `profitFactor`, `debtThreshold` to adjust the
      *  strategist-controlled parameters that will influence whether this call
      *  returns `true` or not. These parameters will be used in conjunction
      *  with the parameters reported to the Vault (see `params`) to determine
@@ -531,24 +645,29 @@ abstract contract BaseStrategy {
      *  https://github.com/iearn-finance/yearn-vaults/blob/master/scripts/keep.py),
      *  or via an integration with the Keep3r network (e.g.
      *  https://github.com/Macarse/GenericKeep3rV2/blob/master/contracts/keep3r/GenericKeep3rV2.sol).
-     * @param callCost The keeper's estimated cast cost to call `harvest()`.
+     * @param callCostInWei The keeper's estimated gas cost to call `harvest()` (in wei).
      * @return `true` if `harvest()` should be called, `false` otherwise.
      */
-    function harvestTrigger(uint256 callCost) public virtual view returns (bool) {
+    function harvestTrigger(uint256 callCostInWei) public virtual view returns (bool) {
+        uint256 callCost = ethToWant(callCostInWei);
         StrategyParams memory params = vault.strategies(address(this));
 
         // Should not trigger if Strategy is not activated
         if (params.activation == 0) return false;
 
+        // Should not trigger if we haven't waited long enough since previous harvest
+        if (block.timestamp.sub(params.lastReport) < minReportDelay) return false;
+
         // Should trigger if hasn't been called in a while
-        if (block.timestamp.sub(params.lastReport) >= minReportDelay) return true;
+        if (block.timestamp.sub(params.lastReport) >= maxReportDelay) return true;
 
         // If some amount is owed, pay it back
-        // NOTE: Since debt is adjusted in step-wise fashion, it is appropriate
-        //       to always trigger here, because the resulting change should be
-        //       large (might not always be the case).
+        // NOTE: Since debt is based on deposits, it makes sense to guard against large
+        //       changes to the value from triggering a harvest directly through user
+        //       behavior. This should ensure reasonable resistance to manipulation
+        //       from user-initiated withdrawals as the outstanding debt fluctuates.
         uint256 outstanding = vault.debtOutstanding();
-        if (outstanding > 0) return true;
+        if (outstanding > debtThreshold) return true;
 
         // Check for profits and losses
         uint256 total = estimatedTotalAssets();
@@ -584,23 +703,27 @@ abstract contract BaseStrategy {
     function harvest() external onlyKeepers {
         uint256 profit = 0;
         uint256 loss = 0;
+        uint256 debtOutstanding = vault.debtOutstanding();
         uint256 debtPayment = 0;
         if (emergencyExit) {
             // Free up as much capital as possible
-            // NOTE: Don't take performance fee in this scenario
-            (profit, loss, debtPayment) = exitPosition(vault.debtOutstanding());
+            uint256 totalAssets = estimatedTotalAssets();
+            // NOTE: use the larger of total assets or debt outstanding to book losses properly
+            (debtPayment, loss) = liquidatePosition(totalAssets > debtOutstanding ? totalAssets : debtOutstanding);
+            // NOTE: take up any remainder here as profit
+            if (debtPayment > debtOutstanding) {
+                profit = debtPayment.sub(debtOutstanding);
+                debtPayment = debtOutstanding;
+            }
         } else {
             // Free up returns for Vault to pull
-            (profit, loss, debtPayment) = prepareReturn(vault.debtOutstanding());
+            (profit, loss, debtPayment) = prepareReturn(debtOutstanding);
         }
 
         // Allow Vault to take up to the "harvested" balance of this contract,
         // which is the amount it has earned since the last time it reported to
         // the Vault.
-        uint256 debtOutstanding = vault.report(profit, loss, debtPayment);
-
-        // Distribute any reward shares earned by the strategy on this report
-        distributeRewards();
+        debtOutstanding = vault.report(profit, loss, debtPayment);
 
         // Check if free returns are left, and re-invest them
         adjustPosition(debtOutstanding);
@@ -609,25 +732,21 @@ abstract contract BaseStrategy {
     }
 
     /**
-     * Liquidate as many assets as possible to `want`, irregardless of
-     * slippage, up to `_amountNeeded`. Any excess should be re-invested
-     * here as well.
-     */
-    function liquidatePosition(uint256 _amountNeeded) internal virtual returns (uint256 _amountFreed);
-
-    /**
      * @notice
      *  Withdraws `_amountNeeded` to `vault`.
      *
      *  This may only be called by the Vault.
      * @param _amountNeeded How much `want` to withdraw.
+     * @return _loss Any realized losses
      */
-    function withdraw(uint256 _amountNeeded) external {
+    function withdraw(uint256 _amountNeeded) external returns (uint256 _loss) {
         require(msg.sender == address(vault), "!vault");
-        // Liquidate as much as possible to `want`, up to `_amount`
-        uint256 amountFreed = liquidatePosition(_amountNeeded);
+        // Liquidate as much as possible to `want`, up to `_amountNeeded`
+        uint256 amountFreed;
+        (amountFreed, _loss) = liquidatePosition(_amountNeeded);
         // Send it directly back (NOTE: Using `msg.sender` saves some gas here)
-        want.transfer(msg.sender, amountFreed);
+        want.safeTransfer(msg.sender, amountFreed);
+        // NOTE: Reinvest anything leftover on next `tend`/`harvest`
     }
 
     /**
@@ -650,7 +769,7 @@ abstract contract BaseStrategy {
         require(msg.sender == address(vault) || msg.sender == governance());
         require(BaseStrategy(_newStrategy).vault() == vault);
         prepareMigration(_newStrategy);
-        want.transfer(_newStrategy, want.balanceOf(address(this)));
+        want.safeTransfer(_newStrategy, want.balanceOf(address(this)));
     }
 
     /**
@@ -666,6 +785,8 @@ abstract contract BaseStrategy {
     function setEmergencyExit() external onlyAuthorized {
         emergencyExit = true;
         vault.revokeStrategy();
+
+        emit EmergencyExitEnabled();
     }
 
     /**
@@ -711,6 +832,48 @@ abstract contract BaseStrategy {
         address[] memory _protectedTokens = protectedTokens();
         for (uint256 i; i < _protectedTokens.length; i++) require(_token != _protectedTokens[i], "!protected");
 
-        IERC20(_token).transfer(governance(), IERC20(_token).balanceOf(address(this)));
+        IERC20(_token).safeTransfer(governance(), IERC20(_token).balanceOf(address(this)));
+    }
+}
+
+abstract contract BaseStrategyInitializable is BaseStrategy {
+    event Cloned(address indexed clone);
+
+    constructor(address _vault) public BaseStrategy(_vault) {}
+
+    function initialize(
+        address _vault,
+        address _strategist,
+        address _rewards,
+        address _keeper
+    ) external virtual {
+        _initialize(_vault, _strategist, _rewards, _keeper);
+    }
+
+    function clone(address _vault) external returns (address) {
+        return this.clone(_vault, msg.sender, msg.sender, msg.sender);
+    }
+
+    function clone(
+        address _vault,
+        address _strategist,
+        address _rewards,
+        address _keeper
+    ) external returns (address newStrategy) {
+        // Copied from https://github.com/optionality/clone-factory/blob/master/contracts/CloneFactory.sol
+        bytes20 addressBytes = bytes20(address(this));
+
+        assembly {
+            // EIP-1167 bytecode
+            let clone_code := mload(0x40)
+            mstore(clone_code, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(clone_code, 0x14), addressBytes)
+            mstore(add(clone_code, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            newStrategy := create(0, clone_code, 0x37)
+        }
+
+        BaseStrategyInitializable(newStrategy).initialize(_vault, _strategist, _rewards, _keeper);
+
+        emit Cloned(newStrategy);
     }
 }
